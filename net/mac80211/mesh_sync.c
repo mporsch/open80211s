@@ -167,12 +167,174 @@ static void mesh_sync_offset_adjust_tbtt(struct ieee80211_sub_if_data *sdata)
 	spin_unlock_bh(&ifmsh->sync_offset_lock);
 }
 
+static void mesh_sync_align_rx_bcn_presp(struct sta_info *sta,
+					 struct ieee80211_mgmt *mgmt,
+					 struct ieee802_11_elems *elems,
+					 u64 t_r)
+{
+	sta->beacon_interval = ieee80211_tu_to_usec(le16_to_cpu(
+			mgmt->u.beacon.beacon_int));
+
+	/* Timing offset calculation (see 13.13.2.2.2) */
+	sta->t_offset = le64_to_cpu(mgmt->u.beacon.timestamp) - t_r;
+}
+
+static inline int tbtt_offset_get(s64 t_offset, u32 bi_min)
+{
+	u32 offset;
+	u64 tmp = abs64(t_offset);
+
+	/* do_div only for unsigned values */
+	offset = do_div(tmp, bi_min);
+
+	/* invert positive offsets to get the offset towards later TBTT */
+	if (t_offset >= 0)
+		return  offset - bi_min;
+	else
+		return -offset;
+}
+
+static inline int tbtt_offset_get_local(struct ieee80211_sub_if_data *sdata, struct sta_info *sta)
+{
+	return tbtt_offset_get(sta->t_offset,
+			       min((u32)ieee80211_tu_to_usec(
+					sta->sdata->vif.bss_conf.beacon_int),
+					sta->beacon_interval));
+}
+
+static inline int tbtt_offset_get_local_inv(struct sta_info *sta, struct ieee80211_sub_if_data *sdata)
+{
+	return tbtt_offset_get(-sta->t_offset,
+			       min((u32)ieee80211_tu_to_usec(
+					sta->sdata->vif.bss_conf.beacon_int),
+					sta->beacon_interval));
+}
+
+static inline int tbtt_offset_get_sta(struct sta_info *staa, struct sta_info *stab)
+{
+	return tbtt_offset_get(stab->t_offset - staa->t_offset,
+			       min(staa->beacon_interval,
+				   stab->beacon_interval));
+}
+
+/*
+ * get offset of STA to its next peer (or local STA) TBTT
+ */
+static int sta_offset_min_get(struct ieee80211_sub_if_data *sdata, struct sta_info *staa)
+{
+	struct sta_info *stab;
+	int offset_min = INT_MIN, offset;
+	struct sta_info *sta_next = NULL;
+
+	/* STA - peer STA */
+	list_for_each_entry(stab, &sdata->local->sta_list, list) {
+		if (!ieee80211_vif_is_mesh(&stab->sdata->vif) ||
+		    !ieee80211_sdata_running(stab->sdata) ||
+		    stab->plink_state != NL80211_PLINK_ESTAB ||
+		    staa == stab)
+			continue;
+
+		offset = tbtt_offset_get_sta(staa, stab);
+		if (offset > offset_min) {
+			offset_min = offset;
+			sta_next = stab;
+		}
+	}
+
+	/* STA - local STA */
+	offset = tbtt_offset_get_local_inv(staa, sdata);
+	if (offset > offset_min) {
+		offset_min = offset;
+		msync_dbg(sdata, "offset %pM - local STA %dus\n",
+			  staa->sta.addr, offset_min);
+	} else if (sta_next) {
+		msync_dbg(sdata, "offset %pM - %pM %dus\n",
+			  staa->sta.addr, sta_next->sta.addr, offset_min);
+	}
+
+	return offset_min;
+}
+
+static void mesh_sync_align_adjust_tbtt(struct ieee80211_sub_if_data *sdata)
+{
+	struct ieee80211_if_mesh *ifmsh = &sdata->u.mesh;
+	struct sta_info *sta;
+	int peer_offset_max = INT_MAX, local_offset_min = INT_MIN, offset;
+	struct sta_info *sta_steady = NULL, *sta_next = NULL;
+
+	WARN_ON(ifmsh->mesh_sp_id != IEEE80211_SYNC_METHOD_VENDOR);
+	BUG_ON(!rcu_read_lock_held());
+
+	/*
+	 * NOTE:
+	 * We only look for TBTT offsets to peer's TBTT later than ours. These
+	 * are always negative (like t_offset). Thus, all following comparisons
+	 * are inverse.
+	 */
+
+	list_for_each_entry(sta, &sdata->local->sta_list, list) {
+		if (!ieee80211_vif_is_mesh(&sta->sdata->vif) ||
+		    !ieee80211_sdata_running(sta->sdata) ||
+		    sta->plink_state != NL80211_PLINK_ESTAB)
+			continue;
+
+		/* peer STA - others (including local STA) */
+		offset = sta_offset_min_get(sdata, sta);
+		if (offset < peer_offset_max) {
+			peer_offset_max = offset;
+			sta_steady = sta;
+		}
+
+		/* local STA - peer STA */
+		offset = tbtt_offset_get_local(sdata, sta);
+		if (offset > local_offset_min) {
+			local_offset_min = offset;
+			sta_next = sta;
+		}
+	}
+
+	if (sta_next)
+		msync_dbg(sdata, "offset local STA - %pM %dus\n",
+			  sta_next->sta.addr, local_offset_min);
+
+	if (local_offset_min < peer_offset_max) {
+		msync_dbg(sdata, "I am the steady node!\n");
+		ifmsh->adjusting_tbtt = false;
+	} else {
+		msync_dbg(sdata, "the steady node is %pM\n",
+			  sta_steady->sta.addr);
+
+		if (local_offset_min < -10000) {
+			msync_dbg(sdata, "adjusting towards %pM by %dus\n",
+				  sta_next->sta.addr, local_offset_min);
+			/*
+			 * Since adjusting the TSF here would
+			 * require a possibly blocking call
+			 * to the driver TSF setter, we punt
+			 * the TSF adjustment to the mesh tasklet
+			 */
+			ifmsh->sync_offset_clockdrift_max = -local_offset_min;
+			set_bit(MESH_WORK_DRIFT_ADJUST, &ifmsh->wrkq_flags);
+			ifmsh->adjusting_tbtt = true;
+		} else {
+			ifmsh->adjusting_tbtt = false;
+		}
+	}
+}
+
 static const struct sync_method sync_methods[] = {
 	{
 		.method = IEEE80211_SYNC_METHOD_NEIGHBOR_OFFSET,
 		.ops = {
 			.rx_bcn_presp = &mesh_sync_offset_rx_bcn_presp,
 			.adjust_tbtt = &mesh_sync_offset_adjust_tbtt,
+		}
+	},
+	{
+		.method = IEEE80211_SYNC_METHOD_VENDOR,
+		.ops = {
+			.rx_bcn_presp = &mesh_sync_align_rx_bcn_presp,
+			.adjust_tbtt = &mesh_sync_align_adjust_tbtt,
 		}
 	},
 };
